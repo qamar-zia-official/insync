@@ -1,950 +1,684 @@
-Kinetous — Agent Engineering Contract
+# Project Instructions: Order Fulfillment Automation Platform
 
-1. Mission
+## 1. Project Overview
 
-Kinetous is a production-oriented fulfillment operations platform for Shopify businesses.
+Build a modular, type-safe, versioned order fulfillment platform that automates the operations occurring after a customer places an order on a Shopify store.
 
-Its job is to orchestrate the operational lifecycle between:
+The system is responsible for receiving order events, validating requests, preventing duplicate processing, allocating inventory across warehouses, determining fulfillment strategies, selecting shipping options, tracking shipments, and presenting fulfillment progress through a dashboard.
 
-Shopify → Kinetous → WMS/3PL → Carrier → Customer
-and back again for tracking, exceptions, returns, refunds, exchanges, and inventory reconciliation.
+Returns are part of the long-term product scope but are explicitly out of scope for the initial implementation.
 
-Kinetous is NOT the storefront, checkout, payment processor, warehouse execution system, or carrier. It is the orchestration and operational intelligence layer.
+### Core engineering objectives
 
-The current product is WEB ONLY.
+Every implementation must prioritize:
 
-2. Your First Rule: Inspect Before You Change
+1. **Correctness and reliability:** Prevent unauthorized operations, duplicate processing, invalid inventory allocations, and inconsistent shipment states.
+2. **Modularity:** Keep responsibilities separated into clearly defined, reusable modules.
+3. **Type safety:** Use explicit types and runtime validation at system boundaries.
+4. **Version isolation:** Allow new API, schema, function, and dashboard versions to evolve without rewriting or breaking existing versions.
+5. **Architectural consistency:** Follow one documented implementation pattern within each version.
+6. **Maintainability:** Keep the codebase understandable, testable, and free from unnecessary abstraction.
+7. **Business configurability:** Allow different businesses to configure their fulfillment policies without rewriting the core fulfillment engine.
 
-Before writing code:
+These are architectural requirements, not optional preferences.
 
-Inspect the repository structure.
+---
 
-Inspect the relevant app/package.
+## 2. Order Fulfillment Lifecycle
 
-Inspect package.json/workspace configuration.
+Understand the complete business workflow before implementing individual features. Each stage must have a clearly defined responsibility, input, output, and failure-handling strategy.
 
-Inspect existing patterns for routing, database access, validation, authentication, UI, errors, logging, and tests.
+### Stage 1: Order Creation and Webhook Reception
 
-Identify the existing implementation that is closest to the requested change.
+1. A customer places an order on a Shopify store.
+2. Shopify sends an order-related webhook to the Hono API.
+3. The API receives the request and identifies the relevant store, event type, and request metadata.
+4. The API verifies the webhook signature using Shopify's documented HMAC verification mechanism and the appropriate store secret.
+5. The request is validated against the schema associated with its API or event version.
 
-Reuse existing abstractions before creating new ones.
+Reject invalid or unauthorized requests before allowing them to trigger fulfillment operations.
 
-Do not assume a library is installed merely because it is listed in this document.
+### Stage 2: Authentication, Authorization, and Idempotency
 
-Do not replace an existing pattern with your preferred pattern without a concrete reason.
+Implement the following concerns as distinct responsibilities:
 
-The repository is the source of truth for implementation details.
-This document is the source of truth for engineering intent and permanent rules.
+- **Webhook verification:** Establish that the request originated from a trusted sender and has not been altered.
+- **Authentication:** Identify the requesting principal or integration where applicable.
+- **Authorization:** Determine whether that principal is permitted to perform the requested operation.
+- **Idempotency:** Ensure that retries or duplicate deliveries do not cause the same logical operation to execute more than once.
 
-If repository reality conflicts with this file:
+For webhook processing:
 
-do not silently rewrite the architecture;
+1. Identify the event using the appropriate stable event identifier, delivery identifier, or business-level idempotency key.
+2. Persist the identifier and relevant processing metadata in the database using an atomic operation and a database-enforced uniqueness constraint where appropriate.
+3. Reject or safely acknowledge duplicate deliveries according to the webhook processing contract.
+4. Prevent unauthorized or invalid requests from entering the fulfillment workflow.
+5. Record the event's processing state so that failures and retries can be handled reliably.
 
-report the conflict;
+Do not assume that storing a request ID alone guarantees idempotency. Define the uniqueness scope, transaction boundaries, retry behavior, and handling of concurrent deliveries.
 
-explain the tradeoff;
+Webhook authenticity, application authentication, and authorization must not be treated as interchangeable mechanisms.
 
-ask for approval when the conflict affects architecture, security, data model, or external contracts.
+### Stage 3: Background Workflow Processing
 
-3. Product Flow
+Once the request has passed the required verification and validation checks, hand off the work to background workflows.
 
-The intended fulfillment lifecycle is:
+Use the project's configured workflow infrastructure to execute long-running or retryable operations outside the synchronous API request.
 
-Shopify order
-→ webhook
-→ Hono boundary
-→ verify/authenticate
-→ idempotency/deduplication
-→ validate
-→ persist
-→ Trigger.dev task
-→ determine fulfillment requirements
-→ find eligible warehouses
-→ check inventory
-→ apply business rules
-→ routing algorithm
-→ choose warehouse
-→ choose fulfillment path
-→ WMS/3PL
-→ pick/pack
-→ shipment
-→ carrier/tracking
-→ Kinetous DB
-→ Shopify/customer UI
+The workflow should receive a validated, versioned input or a durable reference to persisted event data. It must not depend on an in-memory HTTP request remaining available.
 
-Returns extend the lifecycle:
+Background processing must support:
 
-customer/order
-→ return request
-→ eligibility
-→ return routing
-→ return shipment
-→ return warehouse
-→ inspection
-→ condition/disposition
-→ restock / repair / dispose
-→ refund / replacement / exchange
-→ exchange may create a new fulfillment
+- Reliable retries and failure recovery.
+- Idempotent execution of relevant operations.
+- Explicit workflow and shipment states.
+- Structured logging and traceable execution.
+- Handling of partial failures.
+- Safe coordination of concurrent operations.
 
-4. Architecture
+A successfully accepted webhook must not be confused with a successfully completed fulfillment operation.
 
-Preferred conceptual dependency direction:
+### Stage 4: Inventory Evaluation and Warehouse Allocation
 
-web / api / worker
-↓
-application
-↓
-domain
-↓
-db / integrations / validation
+The fulfillment engine must determine which warehouses can fulfill an order based on product availability.
 
-External systems enter through adapters.
+1. Retrieve the relevant order lines and quantities.
+2. Retrieve inventory availability for eligible warehouses.
+3. Exclude warehouses that cannot satisfy the relevant product quantities or other mandatory constraints.
+4. Calculate feasible warehouse allocations for the order.
+5. Identify whether one warehouse can fulfill the complete order.
+6. If no single warehouse can fulfill the complete order, evaluate allocations across multiple warehouses.
+7. Produce explicit fulfillment groups that map products and quantities to their assigned warehouses.
 
-Examples:
+The allocation logic must account for quantities, not merely whether a warehouse contains a product.
 
-Shopify → Shopify adapter → application/domain
-3PL/WMS → provider adapter → application/domain
-Carrier → carrier adapter → application/domain
+For example, if an order requires five units of a product and a warehouse has only three available units, that warehouse cannot independently fulfill all five units.
 
-Do not put business logic in HTTP handlers, React components, Server Actions, or Trigger.dev task wrappers.
+Inventory availability must be defined consistently. Account for reservations, concurrent orders, and inventory changes according to the chosen inventory model.
 
-HTTP handlers are transport adapters.
-Trigger.dev tasks are execution/orchestration adapters.
-React components are presentation.
-Application use cases coordinate work.
-Domain code owns business rules and state transitions.
-Integration adapters own provider-specific behavior.
-DB code owns persistence.
+The allocation engine should produce feasible candidates rather than silently choosing a final commercial shipping decision.
 
-Do not create internal HTTP calls merely to invoke a background task. Trigger.dev/shared application code can call the appropriate application/domain functionality directly.
+### Stage 5: Fulfillment Group Consolidation and Route Evaluation
 
-5. Expected Stack
+After generating feasible warehouse allocations, evaluate whether products or fulfillment groups can be consolidated into fewer shipments or alternative warehouse combinations.
 
-The project context currently identifies:
+Consider the following illustrative scenarios:
 
-TypeScript
+- **Scenario A:** One warehouse contains all required products but is 50 km from the delivery destination.
+- **Scenario B:** Two warehouses can provide the required products, with distances of 10 km and 20 km from the destination.
+- **Scenario C:** Three warehouses must contribute different products, and each is approximately 70 km from the destination.
+- **Scenario D:** Several allocations are feasible, but their shipping costs, delivery estimates, inventory constraints, and operational implications differ.
 
-Next.js
+These scenarios illustrate possible candidates, not predetermined decisions.
 
-React
+The system must distinguish among:
 
-Hono
+- Inventory allocation.
+- Fulfillment group consolidation.
+- Warehouse selection.
+- Shipment planning.
+- Carrier and service selection.
 
-Better Auth
+Each stage should consume a defined input and produce a typed result.
 
-PostgreSQL
+Do not assume that the shortest distance necessarily represents the lowest-cost, fastest, or most profitable fulfillment strategy. Actual decisions may depend on carrier pricing, warehouse operating costs, delivery zones, service availability, handling costs, and other business constraints.
 
-Drizzle
+### Stage 6: Business Policy and Financial Viability
 
-Trigger.dev
+Different businesses may use different policies to determine whether a fulfillment candidate is commercially viable.
 
-Zod
+The system must support an explicit decision policy rather than hardcoding a universal answer into the fulfillment engine.
 
-Tailwind
+Potential policy approaches include:
 
-shadcn/ui
+**Rule-based decisions**
 
-Base UI
+Evaluate predefined conditions such as maximum shipping cost, maximum delivery time, minimum margin, preferred warehouses, or permitted shipment counts.
 
-Motion
+**AI-assisted decisions**
 
-AI SDK
+Use AI to evaluate or rank feasible candidates when business requirements justify it. AI recommendations must respect hard constraints and provide sufficient information for the decision to be understood and audited.
 
-Resend
+**Human approval**
 
-Bun
+Send ambiguous, expensive, exceptional, or commercially sensitive decisions to an authorized person.
 
-Git/GitHub
+These approaches may be combined.
 
-Important: the actual repository wins. Verify installed versions and existing usage before introducing or changing anything.
+The applicable policy must be configurable where appropriate. AI must not independently authorize financial commitments or override mandatory business constraints unless an explicitly authorized policy permits that behavior.
 
-Do not add dependencies casually.
+When a decision requires human approval, the workflow must preserve its state, record the relevant candidates, and resume safely after approval or rejection.
 
-Before adding a dependency, answer:
+### Stage 7: Customer Preferences and Shipping Strategy
 
-Why is it necessary?
+Once feasible warehouse allocations have been established and the applicable business policy has been evaluated, consider the customer's shipping preferences.
 
-Does the repo already solve this?
+Examples include:
 
-Is there a platform/native solution?
+- Lowest available shipping cost.
+- Fastest available delivery.
+- A balance between cost and delivery speed.
+- Specific shipping services or delivery constraints.
+- Other store-defined preferences and eligibility rules.
 
-What maintenance/security/runtime cost does it add?
+Customer preferences must be considered alongside mandatory business constraints, warehouse capabilities, inventory availability, and carrier service availability.
 
-6. Monorepo Intent
+If a preference cannot be satisfied, apply the configured fallback or escalation policy rather than silently violating a requirement.
 
-Preferred structure:
+### Stage 8: Shipment and Carrier Selection
 
-apps/
-web/ # Next.js operations dashboard
-api/ # Hono HTTP boundary
-worker/ # Trigger.dev/background jobs
+Choose the appropriate shipment configuration based on the selected fulfillment groups and the applicable business rules.
 
-packages/
-db/
-auth/
-validation/
-domain/
-application/
-integrations/
-ui/
-config/
+The process may include:
 
-Do not create a generic packages/utils dumping ground.
+1. Selecting eligible carriers and shipping services.
+2. Retrieving rates and delivery estimates.
+3. Comparing available options.
+4. Applying business rules and customer preferences.
+5. Creating shipments through the appropriate carrier integration.
+6. Persisting shipment identifiers, carrier information, tracking numbers, and shipment state.
+7. Handling carrier errors, timeouts, and uncertain outcomes safely.
 
-If the existing repository differs, preserve the existing structure unless a change is justified and approved.
+Keep carrier-specific API details inside the relevant integration modules. The fulfillment domain must not depend directly on a particular carrier's request or response format.
 
-7. Domain Boundaries
+The number of fulfillment groups does not necessarily equal the number of packages or tracking numbers. Model these relationships explicitly.
 
-Shopify owns
+### Stage 9: Tracking, Notifications, and Dashboard
 
-storefront
+After shipment creation, the system must maintain an up-to-date view of fulfillment progress.
 
-checkout
+1. Receive tracking updates from carrier webhooks or other supported tracking mechanisms.
+2. Verify and validate incoming events.
+3. Process duplicate and out-of-order events safely.
+4. Update the relevant shipment state.
+5. Persist the relationship between the shipment, fulfillment group, and original order.
+6. Notify the appropriate users when relevant events occur.
+7. Expose authorized order and shipment information through the dashboard API.
 
-payment
+The dashboard should allow authorized users to inspect fulfillment progress, including relevant information for customers, store owners, managers, and operational staff.
 
-commerce/order source
+The UI must represent the actual persisted state. Do not imply that a shipment has been dispatched, delivered, or otherwise completed without reliable supporting evidence.
 
-Kinetous owns
+Use explicit authorization and tenant or store isolation when exposing order and shipment information.
 
-operational orchestration
+### Stage 10: Returns — Future Scope
 
-routing
+Returns will be implemented as a separate business workflow after the initial fulfillment lifecycle is established.
 
-fulfillment orchestration
+Potential future responsibilities include:
 
-integrations
+- Return eligibility and policy evaluation.
+- Return authorization.
+- Return shipment creation and tracking.
+- Returned inventory receipt and inspection.
+- Restocking decisions.
+- Refunds or replacements.
+- Return-related notifications and audit records.
 
-exceptions
+Do not implement the returns subsystem as part of the initial scope unless explicitly instructed. Design the current architecture so that returns can be introduced without unnecessarily coupling them to the existing fulfillment implementation.
 
-returns
+---
 
-inventory reconciliation
+## 3. Repository Architecture
 
-operational state
+The project must be built inside a Turborepo monorepo.
 
-audit trail
+Use the following high-level organization:
 
-WMS/3PL owns
+- `apps/` — deployable applications.
+- `packages/` — reusable modules, contracts, domain logic, integrations, and shared infrastructure.
 
-physical warehouse execution
+At minimum, the application layer will contain:
 
-Carrier owns
+- The Hono API.
+- The web dashboard.
+- Any additional deployable application explicitly required by the project.
 
-transport
+The shared packages layer will contain reusable functionality organized by responsibility.
 
-shipment movement
+Examples include:
 
-tracking events
+- `packages/domain/` — domain entities, value objects, business invariants, and domain-level types.
+- `packages/application/` — use cases and application orchestration.
+- `packages/integrations/` — external API and service integrations.
+- `packages/contracts/` — shared request, response, and event contracts where appropriate.
+- `packages/infrastructure/` — database access and other technical infrastructure, if required by the established architecture.
 
-Prefer event/webhook-driven synchronization.
+These names are illustrative. Inspect the actual repository and its existing conventions before creating or restructuring directories.
 
-Preferred:
+**Every directory may contain an `INSTRUCTIONS.md` file.** Read the relevant instructions before modifying files within that directory. Follow their requirements alongside this document.
 
-3PL/WMS → webhook/event → Kinetous → DB → Shopify
+Do not invent a parallel architecture when the repository already defines an appropriate one.
 
-Polling is a fallback when a provider lacks usable webhooks/events.
+### Separation of responsibilities
 
-8. Warehouse Routing Rules
+Maintain clear boundaries between:
 
-Never implement routing as simply:
+- HTTP transport and request handling.
+- Authentication, authorization, and signature verification.
+- Runtime validation and public contracts.
+- Application use cases and workflow orchestration.
+- Domain rules and fulfillment decisions.
+- Database access and persistence.
+- External service integrations.
+- Background execution.
+- Dashboard presentation and client-side state.
 
-“choose the nearest warehouse.”
+An API route should not contain the entire fulfillment algorithm. A carrier integration should not decide general warehouse allocation policy. A dashboard component should not independently reimplement domain business rules.
 
-First establish eligible warehouses using relevant constraints such as:
+Expose reusable functionality through well-defined package interfaces rather than copying business logic across applications.
 
-required inventory
+---
 
-destination coverage
+## 4. Mandatory Versioning Strategy
 
-service coverage
+Versioning is a fundamental architectural requirement.
 
-warehouse rules
+Every externally consumed API contract and every version-specific interface must be identifiable, documented, tested, and compatible with the versions that depend on it.
 
-capacity
+The goal is to allow new functionality to evolve without rewriting existing versions or accidentally changing their behavior.
 
-safety stock
+### 4.1 API versioning
 
-business constraints
+Organize API implementations by explicit version.
 
-Only then optimize among eligible candidates using factors such as:
+For example:
 
-shipping cost
+`apps/api/src/v1/`
 
-SLA
+`apps/api/src/v2/`
 
-distance
+Each API version must contain or reference the appropriate version-specific routes, request and response contracts, validation schemas, and handlers.
 
-business priority
+The exact folder structure must follow the API's `ARCHITECTURE.md` documentation.
 
-carrier/shipping constraints
+A new API version must not silently replace the implementation of an existing version.
 
-Routing logic belongs in the domain/application layer, not the HTTP layer.
+For example, if V1 exposes an endpoint that creates a database record using a particular payload, a new payload or materially different behavior must be introduced through the appropriate versioned contract and implementation.
 
-9. Security Is a System Property
+V1 must continue to operate according to its documented contract until it is explicitly deprecated or retired under an approved migration plan.
 
-Treat every external boundary as untrusted.
+### 4.2 Version-specific functions
 
-Untrusted inputs include:
+Version-sensitive functions must be organized so that each API version can evolve independently.
 
-URL params
+For example:
 
-query params
+- `packages/application/src/v1/`
+- `packages/application/src/v2/`
 
-headers
+A version-specific function must not be modified in a way that unexpectedly changes the behavior of an older API version.
 
-cookies before session verification
+When a new API version requires a different function contract or implementation, create a new versioned function rather than rewriting the existing one.
 
-JSON/form bodies
+For strict version isolation, each API version must have its own version-specific function entry points, even when the initial payloads are identical.
 
-file uploads
+Unchanged, low-level internal utilities may be shared only when they do not introduce coupling between versioned contracts or cause an older version's behavior to change. Do not duplicate every generic utility merely for the appearance of versioning.
 
-webhook payloads before signature verification
+Each versioned function must have explicit input and output types and a clear responsibility.
 
-third-party API responses
+### 4.3 Version-specific validation schemas
 
-user-controlled identifiers
+Use Zod for runtime validation where it is the established project standard.
 
-Ask:
+Maintain separate validation schemas for different public API versions and version-sensitive function contracts.
 
-Who are you?
+For example:
 
-Are you allowed to do this?
+- `packages/contracts/src/v1/`
+- `packages/contracts/src/v2/`
 
-Is this input valid?
+A new schema must not overwrite an older schema when the expected payload, validation rules, or response contract changes.
 
-Are you allowed to access THIS organization/object?
+Schemas must remain consistent with their corresponding types, functions, routes, and tests.
 
-Can this operation safely happen?
+Validation must occur at appropriate system boundaries. TypeScript types alone do not validate incoming HTTP requests, webhook payloads, or external API responses at runtime.
 
-Authentication is not authorization.
+### 4.4 Version-specific tests
 
-Every organization-scoped resource must be tenant-scoped server-side.
+Maintain tests that correspond to each versioned contract and implementation.
 
-Never trust organization IDs supplied by the client.
+Examples include:
 
-Never expose privileged writable fields through blind object spreading.
+- V1 API route tests.
+- V1 request and response validation tests.
+- V1 function tests.
+- V1 integration contract tests.
+- V1 dashboard compatibility tests where applicable.
 
-Never put secrets, SQL, stack traces, credentials, internal hostnames, or raw provider/database errors in API responses.
+New versions must receive their own tests for their intended behavior.
 
-10. Request Classes
+Changes to a newer version must not cause older-version tests to fail unless an explicitly approved compatibility change requires it.
 
-Browser API
+Test shared internal utilities according to their own contracts, while ensuring that every public version remains covered.
 
-request
-→ request ID
-→ CORS
-→ authentication
-→ CSRF where applicable
-→ authorization
-→ validation
-→ application use case
+### 4.5 Database compatibility and migrations
 
-Shopify/provider webhook
+Database schemas and migrations must be managed separately from application API versioning.
 
-request
-→ request ID
-→ body-size limit
-→ raw-body signature verification
-→ durable deduplication/idempotency
-→ validation
-→ persist event
-→ enqueue/background processing
-→ fast 2xx
+Do not create a new database schema or migration solely because an API version number changes.
 
-Do not use CORS as webhook authentication.
+Instead, design database changes so that existing API versions can continue operating safely during the transition.
 
-Verify Shopify signatures against the raw body and use timing-safe comparison where applicable.
+Use backward-compatible migration strategies where necessary, such as introducing new fields before migrating consumers or retiring old fields.
 
-Machine-to-machine API
+A change to a public API contract, a database schema, or an internal function must be versioned according to its own compatibility requirements.
 
-request
-→ authentication
-→ authorization
-→ schema validation
-→ rate limits
-→ application
+### 4.6 Dashboard versioning
 
-Background job
+Dashboard versions must follow a consistent and documented architecture.
 
-validated execution context
-→ validated payload
-→ idempotency
-→ authorization/context
-→ timeout/retry policy
-→ application use case
+When a new dashboard version requires different API contracts, state management, component behavior, or layouts, preserve the existing version where compatibility is required.
 
-11. Validation
+Do not silently rewrite older dashboard implementations to accommodate a new API version.
 
-Use runtime validation at trust boundaries.
+Each dashboard version must clearly identify the API contract it consumes.
 
-Zod is the expected validation mechanism where the repository already uses it.
+Shared UI primitives may be reused when doing so does not create unintended coupling between version-specific behavior.
 
-Validate:
+### 4.7 Integration versioning
 
-path params
+External integrations must have explicit, typed interfaces and version-specific implementations when their contracts or behavior change.
 
-query params
+For example, a carrier integration or database-facing application function must not be modified in a way that breaks an older API version.
 
-relevant headers
+Keep provider-specific payloads and response formats isolated within their integration boundaries. Translate them into stable internal types before passing data into the domain or application layers.
 
-JSON bodies
+### 4.8 Compatibility rules
 
-form data
+For every versioned component, document:
 
-environment variables
+- Its purpose and public interface.
+- Its input and output types.
+- Its validation requirements.
+- Its dependencies.
+- The versions of other components it supports.
+- Its error-handling behavior.
+- Its testing strategy.
+- Its deprecation or migration requirements, if applicable.
 
-webhook payloads after authentication
+Never assume that two components are compatible simply because their TypeScript types currently compile.
 
-external API responses
+Compatibility must be established through documented contracts and appropriate tests.
 
-TypeScript types do not replace runtime validation.
+---
 
-Treat third-party API responses as untrusted.
+## 5. Architectural Consistency Within Each Version
 
-12. Idempotency and Distributed-System Rules
+Each version must follow one coherent implementation pattern.
 
-Never blindly retry mutations.
+For example, if V1 uses a particular approach for API routing, request validation, authentication, error handling, and response serialization, all V1 endpoints must follow that approach unless a documented exception is necessary.
 
-Important mutations include:
+The same principle applies to dashboard versions, background workflows, integrations, and shared packages.
 
-fulfillment creation
+### Required documentation
 
-shipment creation
+Each major application or independently versioned subsystem must have an `ARCHITECTURE.md` file.
 
-refund
+Document the following where relevant:
 
-inventory adjustment
+1. The architectural pattern used.
+2. The directory and file organization.
+3. Naming conventions.
+4. The request or data flow.
+5. Dependency boundaries.
+6. Validation and type definitions.
+7. Authentication and authorization.
+8. Error handling and logging.
+9. Versioning and compatibility rules.
+10. Testing conventions.
+11. How to add a new feature without breaking existing code.
 
-external writes
+A developer or AI coding agent should be able to read the architecture document and understand how to implement another feature using the established pattern.
 
-email where duplicate delivery matters
+Do not document only what the system does. Explain how its components are organized and how new code is expected to follow the same conventions.
 
-Use durable idempotency/deduplication.
+If an architectural change becomes necessary, update the relevant documentation and migrate the affected code deliberately rather than mixing competing patterns within one version.
 
-Prefer database-enforced uniqueness where possible.
+---
 
-Webhook delivery must be safe under:
+## 6. Type Safety and Reusable Modules
 
-duplicates
+The entire codebase must use clear, explicit types and modular interfaces.
 
-concurrent duplicates
+Every reusable function should have a well-defined responsibility, typed inputs, typed outputs, and predictable error behavior.
 
-replay
+Where practical, use TypeScript's type inference to reduce unnecessary annotations while keeping public interfaces explicit and understandable.
 
-retries
+### Type safety requirements
 
-partial failure
+- Define explicit types for public function parameters and return values.
+- Validate untrusted runtime data with appropriate schemas.
+- Keep external provider types separate from internal domain types.
+- Avoid `any` and unsafe type assertions unless there is a documented justification.
+- Use discriminated unions for stateful workflows and other cases where they improve correctness.
+- Represent failure conditions explicitly rather than hiding them in loosely typed return values.
+- Ensure editor autocomplete and compile-time checks work across package boundaries.
+- Keep package exports intentional and well-defined.
 
-Assume requests and jobs can run concurrently.
+Types and validation schemas must describe the same contract. Where supported by the project's tooling, infer TypeScript types from Zod schemas to reduce duplication and prevent inconsistencies.
 
-Ask what happens if:
+### Reusability requirements
 
-DB succeeds but provider fails;
+A reusable capability should be callable from the appropriate application or subsystem without copying its implementation.
 
-provider succeeds but DB update fails;
+For example, external service integrations should live in integration packages, while reusable business operations should live in the appropriate application or domain package.
 
-the same webhook arrives twice;
+A function should not depend on a specific HTTP route, dashboard component, or execution environment unless that dependency is explicitly part of its responsibility.
 
-two workers process the same order;
+Do not force every module into a universal interface. Design interfaces around actual responsibilities and stable boundaries.
 
-a provider times out after accepting a mutation;
+The objective is reusable, well-typed software—not abstraction for its own sake.
 
-a job retries after partial completion.
+---
 
-13. State Machines
+## 7. Security and Reliability Standards
 
-Do not allow arbitrary state assignment such as:
+Security-sensitive behavior must be implemented consistently within each version.
 
-{ "status": "fulfilled" }
+This includes:
 
-Use explicit commands/use cases such as:
+- Webhook signature verification.
+- Authentication and authorization.
+- Input validation.
+- Tenant and store isolation.
+- Database access controls.
+- Idempotency.
+- Secret management.
+- Error handling.
+- Auditability of important operations.
 
-ProcessOrder
+Use the appropriate mechanism for each security boundary. Do not treat successful payload validation as proof of authenticity or authorization.
 
-RouteOrder
+For background workflows, use durable state and explicit retry policies. Account for concurrent execution, duplicate events, partial completion, and failures occurring after an external service has accepted a request.
 
-CreateFulfillment
+For database operations, use transactions and database constraints where required to preserve invariants.
 
-CreateShipment
+Never log credentials, access tokens, webhook secrets, or unnecessary sensitive customer information.
 
-RetryFulfillment
+Security and reliability mechanisms should be reusable where appropriate, documented, and covered by tests.
 
-CancelFulfillment
+---
 
-ResolveException
+## 8. Integration and Connector Organization
 
-ReconcileInventory
+External APIs, databases, and third-party services must be accessed through clearly organized modules.
 
-A state transition should verify:
+For example, if the system integrates with Shopify, multiple shipping carriers, a notification provider, and a mapping or distance service, organize these integrations by provider or capability under the established integration package.
 
-actor/context
+Each integration should define:
 
-authorization
+- Its public interface.
+- Input and output types.
+- Provider-specific request and response handling.
+- Authentication and configuration requirements.
+- Runtime validation of untrusted responses where appropriate.
+- Timeout and retry behavior.
+- Error translation.
+- Logging and observability requirements.
+- Relevant tests.
 
-current state
+Keep provider-specific implementation details out of the core fulfillment domain.
 
-legal transition
+For example, the fulfillment engine should request eligible shipping options through an internal interface rather than directly constructing requests for a specific carrier API.
 
-business preconditions
+When replacing or adding a provider, the system should require minimal changes to unrelated application and domain code.
 
-14. Transactions and Outbox
+Reuse existing connectors and shared capabilities when they satisfy the requirements. Do not create duplicate integrations or slightly different copies of the same functionality.
 
-Use transactions when atomicity is required, not automatically for every request.
+---
 
-For coupled state/event changes, prefer the outbox pattern where appropriate:
+## 9. Change Tracking and Documentation
 
-BEGIN
-→ lock/check relevant state
-→ validate transition
-→ update domain record
-→ write audit/event record
-→ write outbox event
-COMMIT
+Maintain a root-level file named `changes.md`.
 
-Then process outbound effects asynchronously.
+**Every project modification must be recorded in this file.**
 
-This prevents “database committed but event was lost” failure modes.
+Update it whenever you create, modify, remove, or restructure code, configuration, documentation, schemas, tests, or other project artifacts.
 
-15. Error Handling
+Each entry should clearly state:
 
-Domain/application layers must not depend directly on Hono.
+- What changed.
+- Why the change was necessary.
+- Which modules or versions were affected.
+- Any contract, schema, or migration implications.
+- The tests or verification performed.
+- Any known limitations or follow-up work.
 
-Use application/domain errors.
-Convert them to transport-specific HTTP responses at the API boundary.
+Keep entries concise but sufficiently detailed to understand the history of the project.
 
-Expected API semantics include:
+Do not claim that tests passed unless they were actually executed and their results were verified.
 
-400 malformed request
+Preserve existing entries. Do not replace the entire change history with a summary of the latest work.
 
-401 unauthenticated
+Update `ARCHITECTURE.md` and relevant `INSTRUCTIONS.md` files whenever implementation changes affect their documented conventions or responsibilities.
 
-403 authenticated but forbidden
+---
 
-404 missing/hidden resource
+## 10. AI Coding Agent Operating Procedure
 
-409 state/conflict
+Before making any code changes, follow this procedure.
 
-413 payload too large
+### Step 1: Inspect the repository
 
-415 unsupported media type
+- Examine the Turborepo structure.
+- Read the root-level project instructions and relevant directory-level `INSTRUCTIONS.md` files.
+- Read the relevant `ARCHITECTURE.md` files.
+- Identify existing package boundaries, versioning conventions, tests, and scripts.
+- Locate existing implementations before creating new ones.
 
-422 valid structure but invalid semantics
+Do not assume that the repository is empty or that the illustrative folder structure in this document matches its current implementation.
 
-429 rate limited
+### Step 2: Define the change
 
-500 internal failure
+Before implementation, determine:
 
-502 upstream failure
+- The business or technical requirement.
+- The existing components involved.
+- The API, function, schema, integration, and dashboard versions affected.
+- The required compatibility guarantees.
+- The expected failure cases.
+- The tests needed to verify the change.
 
-503 temporary unavailable
+Prefer the smallest complete implementation that satisfies the requirement.
 
-504 upstream timeout
+### Step 3: Implement consistently
 
-Keep internal diagnostics in logs.
+- Follow the established architecture for the relevant version.
+- Reuse existing modules when appropriate.
+- Keep responsibilities separated.
+- Preserve existing contracts.
+- Introduce new versioned implementations when required.
+- Add explicit types and runtime validation.
+- Avoid unrelated refactoring.
+- Update documentation when necessary.
 
-Use server-generated request IDs for authoritative tracing.
+Do not introduce a new architectural pattern merely because it seems preferable without evaluating its impact on the existing codebase.
 
-16. Observability
+### Step 4: Verify the implementation
 
-Production-oriented code should be designed for:
+Run the relevant available checks, including:
 
-structured logs
+- Type checking.
+- Linting.
+- Unit tests.
+- Integration tests where applicable.
+- API contract and validation tests.
+- Compatibility tests for affected older versions.
+- Build checks for affected applications and packages.
 
-request IDs
+Inspect the results and resolve regressions introduced by the change.
 
-useful metrics
+If a check cannot be run, state the reason explicitly. Never report an unexecuted check as successful.
 
-external API latency
+### Step 5: Record the change
 
-DB latency
+Update `changes.md` and any affected architectural documentation.
 
-webhook failures
+Ensure that the recorded changes match the actual implementation and verified test results.
 
-background-job failures
+### Step 6: Report completion
 
-queue/backlog visibility
+When finishing a task, provide a concise summary of:
 
-tracing across HTTP → application → DB → job → provider
+1. What was implemented.
+2. Which files, packages, or versions were affected.
+3. What tests and checks were executed.
+4. Whether backward compatibility was preserved.
+5. Any unresolved issues or required follow-up work.
 
-alerts for significant failure conditions
+Do not claim completion if critical implementation or verification steps remain unfinished.
 
-Do not log secrets or sensitive customer data unnecessarily.
+---
 
-17. Database Rules
+## 11. Code Quality and Design Constraints
 
-Use Drizzle and the existing repository patterns.
-
-Prefer:
-
-parameterized queries
-
-explicit writable fields
-
-tenant scoping
-
-database constraints for invariants
-
-indexes based on actual access patterns
-
-migrations for schema changes
-
-Never construct SQL by concatenating untrusted input.
-
-Do not use request bodies as direct database update objects.
-
-18. UI Rules
-
-The current product is a web operations dashboard.
-
-Use the UI system/components already established in the repository.
-
-Before introducing a new UI primitive:
-
-find the existing equivalent;
-
-reuse it if appropriate;
-
-follow existing spacing, typography, layout, form, table, modal, toast, and state patterns.
-
-Do not redesign the application merely because you personally prefer another component library or visual style.
-
-Do not invent mobile apps, React Native clients, desktop apps, or unrelated surfaces unless explicitly requested.
-
-For UI work, inspect nearby screens and components first so the new UI looks native to the existing application.
-
-19. Code Style / Maintainability
-
-The goal is code that looks like it belongs in the existing codebase.
-
-Prefer:
-
-existing naming conventions
-
-existing folder conventions
-
-existing error patterns
-
-existing data-access patterns
-
-existing component patterns
-
-small composable functions
-
-explicit types at boundaries
-
-narrow abstractions
-
-clear domain names
+The codebase must remain simple, consistent, and easy to navigate as it grows.
 
 Avoid:
 
-speculative abstractions
-
-giant files
-
-generic helpers with unclear ownership
-
-premature framework layers
-
-duplicated business rules
-
-unrelated refactors
-
-clever code that obscures business behavior
-
-Do not “clean up” unrelated code while completing a task.
-
-20. Testing
-
-Add tests at the appropriate level.
-
-At minimum, consider:
-
-domain/business-rule tests
-
-application/use-case tests
-
-integration tests for persistence/provider boundaries
-
-API tests
-
-authorization tests
-
-idempotency/replay tests
-
-concurrency-sensitive tests where relevant
-
-UI/e2e tests for important user workflows
-
-A task is not complete merely because TypeScript compiles.
-
-Verify behavior.
-
-21. Agent Workflow
-
-For every task:
-
-Phase A — Understand
-
-Read:
-
-this file;
-
-relevant docs/ai/current-state.md;
-
-relevant task file, if present;
-
-relevant architecture/ADR/research notes;
-
-relevant source code and tests.
-
-Phase B — Investigate
-
-Before changing code, identify:
-
-existing implementation;
-
-dependencies;
-
-trust boundaries;
-
-data flow;
-
-failure modes;
-
-tests;
-
-likely affected files.
-
-Phase C — Plan
-
-For non-trivial work, state:
-
-objective;
-
-files likely to change;
-
-implementation approach;
-
-risks;
-
-acceptance criteria;
-
-verification commands.
-
-If the requested implementation conflicts with architecture or security rules, stop and surface the conflict.
-
-Phase D — Implement
-
-Make the smallest coherent change that satisfies the task.
-
-Do not rewrite unrelated files.
-
-Phase E — Verify
-
-Run the narrowest useful tests first, then broader verification.
-
-Typical commands, only if they exist in the repo:
-
-bun test
-
-bun run lint
-
-bun run typecheck
-
-relevant package tests/builds
-
-Inspect the final diff.
-
-Phase F — Report
-
-Return:
-
-what changed;
-
-why;
-
-files changed;
-
-tests/verification performed;
-
-known limitations;
-
-new concepts/dependencies introduced;
-
-decisions that should become ADRs or research notes.
-
-22. “New Concept” Rule
-
-The developer explicitly wants to understand the system rather than receive foreign-looking code.
-
-Whenever you introduce a concept that is new to the current project, call it out.
-
-Examples:
-
-outbox pattern
-
-idempotency key
-
-advisory lock
-
-transaction boundary
-
-new queue mechanism
-
-new authentication mechanism
-
-new provider abstraction
-
-new caching layer
-
-new UI state pattern
-
-new dependency
-
-new database constraint
-
-new architectural layer
-
-For each new concept, briefly explain:
-
-what it is;
-
-why this task needs it;
-
-where it lives;
-
-what tradeoff it introduces.
-
-Do not introduce new concepts merely because they are fashionable.
-
-23. Architecture Changes
-
-Architecture changes require explicit reasoning.
-
-Do not:
-
-replace Hono;
-
-replace Next.js;
-
-replace Drizzle;
-
-replace Better Auth;
-
-replace Trigger.dev;
-
-replace the UI system;
-
-create a new major service;
-
-introduce a new database;
-
-create a new message broker;
-
-move business logic across layers
-
-without explaining the reason, alternatives, and consequences.
-
-If the change is material, create/update an ADR.
-
-24. Documentation State Model
-
-Keep these concepts separate:
-
-Permanent engineering rule → AGENTS.md
-
-Architecture decision → docs/ai/decisions/
-
-Current state → docs/ai/current-state.md
-
-Research → docs/ai/research/
-
-Task → docs/ai/tasks/
-
-Learning → docs/ai/learnings.md
-
-Do not put the entire project history into AGENTS.md.
-
-The repository/Git is the durable project memory. Chat history is disposable.
-
-25. Task Contract
-
-When receiving a task, interpret it using:
-
-Objective
-
-What must become true?
-
-Context
-
-What existing code/state matters?
-
-Constraints
-
-What must not change?
-
-Files
-
-Which files/packages are relevant?
-
-Acceptance Criteria
-
-What observable behavior proves completion?
-
-Verification
-
-Which tests/checks prove it?
-
-Open Questions
-
-What remains uncertain?
-
-If a task is underspecified but a safe implementation can proceed, make the smallest reasonable assumption and state it.
-If the ambiguity could cause data loss, security problems, architectural drift, or a wrong external contract, stop and ask.
-
-26. Hard Stops
-
-Stop and ask before:
-
-destructive data migrations;
-
-deleting production data;
-
-changing authentication/session semantics;
-
-weakening authorization;
-
-changing tenant isolation;
-
-changing webhook signature verification;
-
-changing external API contracts;
-
-changing fulfillment/refund/shipment semantics;
-
-adding major infrastructure;
-
-introducing irreversible architecture;
-
-hiding a failing test instead of fixing the cause.
-
-Never bypass a security control merely to make a test or integration pass.
-
-27. Final Principle
-
-The agent's job is not:
-
-“write code that looks plausible.”
-
-The job is:
-
-understand the existing system
-→ make a justified change
-→ preserve architectural invariants
-→ verify behavior
-→ explain what changed
-→ leave the repository easier for the next engineer or agent to understand.
-
-Prefer correctness, consistency, explicit tradeoffs, and verifiable behavior over speed of code generation.
+- Duplicated business logic.
+- Monolithic API handlers.
+- Circular dependencies between packages.
+- Unnecessary abstractions and excessive indirection.
+- Inconsistent naming and error-handling patterns.
+- Hidden coupling between API versions.
+- Direct provider-specific logic inside domain modules.
+- Uncontrolled changes to shared functions.
+- Excessive folder nesting without a clear purpose.
+- Rewriting existing versions when introducing new behavior.
+- Documentation that no longer matches the code.
+
+Prefer:
+
+- Small, cohesive modules.
+- Explicit public interfaces.
+- Clear dependency direction.
+- Predictable data flow.
+- Consistent naming conventions.
+- Typed contracts and validated boundaries.
+- Reusable integrations.
+- Focused tests.
+- Documented architectural decisions.
+- Backward-compatible evolution.
+
+Do not optimize for maximum abstraction or minimum line count. Optimize for correctness, clarity, consistency, and maintainability.
+
+---
+
+## 12. Final Decision Rule
+
+Whenever implementing a feature, use the following order of priorities:
+
+1. Preserve security and business correctness.
+2. Preserve existing version contracts and behavior.
+3. Follow the documented architecture.
+4. Reuse appropriate existing capabilities.
+5. Introduce new versioned contracts or implementations where required.
+6. Add appropriate tests and verification.
+7. Update `changes.md` and relevant documentation.
+8. Report the verified outcome accurately.
+
+If a requirement conflicts with an existing architectural rule, do not silently choose one or introduce an undocumented exception. Identify the conflict, evaluate its impact, and seek clarification when the decision materially affects compatibility or system design.
+
+The final objective is a production-oriented fulfillment platform in which every component has a clear responsibility, every public contract is explicit, every version remains predictable, and new functionality can be added without turning the codebase into an inconsistent collection of interconnected implementations.

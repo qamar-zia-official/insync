@@ -19,5 +19,10 @@
     "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
+  },
+  "dependencies": {
+    "@shopify/shopify-api": "^15.1.1",
+    "install": "^0.13.0",
+    "npm": "^12.2.1"
   }
 }

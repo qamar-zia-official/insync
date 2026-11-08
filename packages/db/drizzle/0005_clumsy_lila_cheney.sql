@@ -1,1 +1,0 @@
-CREATE UNIQUE INDEX "exceptions_open_order_type_unique" ON "exceptions" USING btree ("order_id","type") WHERE "exceptions"."status" = 'open';
